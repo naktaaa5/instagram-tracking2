@@ -1,8 +1,84 @@
 const NOTION_TOKEN     = process.env.NOTION_TOKEN;
 const INSTAGRAM_TOKEN  = process.env.INSTAGRAM_TOKEN;
 const NOTION_DB_ID     = process.env.NOTION_DB_ID;
-const IG_ACCOUNT_ID    = process.env.IG_ACCOUNT_ID;
 const IG_BASE_URL = 'https://graph.facebook.com/v25.0/';
+
+let resolvedIgAccountId = null;
+
+async function findIgAccountId() {
+  if (resolvedIgAccountId) return resolvedIgAccountId;
+
+  // 방법 1: me/accounts에서 instagram_business_account 찾기
+  try {
+    const res = await fetch(
+      `${IG_BASE_URL}me/accounts?fields=instagram_business_account&access_token=${INSTAGRAM_TOKEN}`
+    );
+    const data = await res.json();
+    for (const page of (data.data || [])) {
+      if (page.instagram_business_account) {
+        resolvedIgAccountId = page.instagram_business_account.id;
+        console.log('[IG Account] me/accounts에서 찾음:', resolvedIgAccountId);
+        return resolvedIgAccountId;
+      }
+    }
+  } catch (e) { console.log('[IG Account] me/accounts 실패:', e.message); }
+
+  // 방법 2: me/media에서 게시물 하나 가져와서 owner 조회
+  try {
+    const res = await fetch(
+      `${IG_BASE_URL}me/media?fields=id&limit=1&access_token=${INSTAGRAM_TOKEN}`
+    );
+    const data = await res.json();
+    if (data.data && data.data.length > 0) {
+      const mediaId = data.data[0].id;
+      const ownerRes = await fetch(
+        `${IG_BASE_URL}${mediaId}?fields=owner&access_token=${INSTAGRAM_TOKEN}`
+      );
+      const ownerData = await ownerRes.json();
+      if (ownerData.owner && ownerData.owner.id) {
+        resolvedIgAccountId = ownerData.owner.id;
+        console.log('[IG Account] owner 조회로 찾음:', resolvedIgAccountId);
+        return resolvedIgAccountId;
+      }
+    }
+  } catch (e) { console.log('[IG Account] me/media 실패:', e.message); }
+
+  // 방법 3: 노션 DB에서 기존 Instagram ID로 owner 조회
+  try {
+    const body = {
+      filter: {
+        property: 'Instagram ID',
+        rich_text: { is_not_empty: true }
+      },
+      page_size: 1
+    };
+    const dbRes = await fetch(`https://api.notion.com/v1/databases/${NOTION_DB_ID}/query`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${NOTION_TOKEN}`,
+        'Notion-Version': '2022-06-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    const dbData = await dbRes.json();
+    const existingId = dbData.results?.[0]?.properties?.['Instagram ID']?.rich_text?.[0]?.text?.content;
+    if (existingId) {
+      const ownerRes = await fetch(
+        `${IG_BASE_URL}${existingId}?fields=owner&access_token=${INSTAGRAM_TOKEN}`
+      );
+      const ownerData = await ownerRes.json();
+      if (ownerData.owner && ownerData.owner.id) {
+        resolvedIgAccountId = ownerData.owner.id;
+        console.log('[IG Account] 노션 기존 데이터에서 찾음:', resolvedIgAccountId);
+        return resolvedIgAccountId;
+      }
+    }
+  } catch (e) { console.log('[IG Account] 노션 조회 실패:', e.message); }
+
+  console.error('[IG Account] IG 계정 ID를 찾을 수 없습니다');
+  return null;
+}
 
 async function notionRequest(endpoint, method = 'GET', body = null) {
   const opts = {
@@ -39,9 +115,7 @@ async function queryDatabase(filter) {
 
 async function updatePage(pageId, properties) {
   const result = await notionRequest(`pages/${pageId}`, 'PATCH', { properties });
-  if (result.object === 'error') {
-    return { success: false, error: result.message };
-  }
+  if (result.object === 'error') return { success: false, error: result.message };
   return { success: true };
 }
 
@@ -63,24 +137,19 @@ async function getMediaInfo(mediaId) {
       `${IG_BASE_URL}${mediaId}?fields=like_count,comments_count,media_type&access_token=${INSTAGRAM_TOKEN}`
     );
     return await res.json();
-  } catch (e) {
-    return { error: e.message };
-  }
+  } catch (e) { return { error: e.message }; }
 }
 
 async function getMediaInsights(mediaId, mediaType) {
   const isVideo = (mediaType === 'VIDEO' || mediaType === 'REEL');
   const isCarousel = (mediaType === 'CAROUSEL_ALBUM');
   const metrics = isVideo ? 'saved,reach,views' : (isCarousel ? 'saved,reach' : 'saved,reach,impressions');
-
   try {
     const res = await fetch(
       `${IG_BASE_URL}${mediaId}/insights?metric=${metrics}&access_token=${INSTAGRAM_TOKEN}`
     );
     const data = await res.json();
-    if (data.error) {
-      return { saved: 0, reach: 0, views: 0, insightError: data.error.message };
-    }
+    if (data.error) return { saved: 0, reach: 0, views: 0, insightError: data.error.message };
     let saved = 0, reach = 0, views = 0;
     for (const metric of (data.data || [])) {
       if (metric.name === 'saved') saved = metric.values[0]?.value || 0;
@@ -89,16 +158,15 @@ async function getMediaInsights(mediaId, mediaType) {
       if (metric.name === 'impressions') views = metric.values[0]?.value || 0;
     }
     return { saved, reach, views, insightError: null };
-  } catch (e) {
-    return { saved: 0, reach: 0, views: 0, insightError: e.message };
-  }
+  } catch (e) { return { saved: 0, reach: 0, views: 0, insightError: e.message }; }
 }
 
 async function getRecentMedia() {
+  const igId = await findIgAccountId();
+  if (!igId) { console.error('[Error] IG 계정 ID를 찾을 수 없어 게시물 목록 조회 불가'); return []; }
   try {
-    if (!IG_ACCOUNT_ID) { console.error('[Error] IG_ACCOUNT_ID 없음'); return []; }
     const res = await fetch(
-      `${IG_BASE_URL}${IG_ACCOUNT_ID}/media?fields=id,permalink,caption,like_count,comments_count,timestamp,media_type&limit=50&access_token=${INSTAGRAM_TOKEN}`
+      `${IG_BASE_URL}${igId}/media?fields=id,permalink,caption,like_count,comments_count,timestamp,media_type&limit=50&access_token=${INSTAGRAM_TOKEN}`
     );
     const data = await res.json();
     if (data.error) { console.error('[Media Error]', data.error.message); return []; }
@@ -233,7 +301,6 @@ async function main() {
   if (!NOTION_TOKEN) missing.push('NOTION_TOKEN');
   if (!INSTAGRAM_TOKEN) missing.push('INSTAGRAM_TOKEN');
   if (!NOTION_DB_ID) missing.push('NOTION_DB_ID');
-  if (!IG_ACCOUNT_ID) missing.push('IG_ACCOUNT_ID');
   if (missing.length > 0) { console.error('누락된 환경변수:', missing.join(', ')); process.exit(1); }
   const newResult = await processNewPosts();
   console.log('신규:', JSON.stringify(newResult, null, 2));
